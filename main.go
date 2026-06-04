@@ -473,8 +473,27 @@ func main() {
 	if listenInterface == "" {
 		listenInterface = ":8080"
 	}
+
+	// Build an explicit http.Server so the HTTP timeouts are configurable.
+	// gin.Engine.Run() uses http.ListenAndServe with a zero-value server, which
+	// makes these timeouts impossible to tune. All values default to 0 (no
+	// timeout), preserving the previous behavior, and can be raised/lowered via
+	// environment variables. A WriteTimeout in particular would otherwise abort
+	// long-running synchronous LLM requests (e.g. local Ollama models) once it
+	// elapses.
+	srv := &http.Server{
+		Addr:              listenInterface,
+		Handler:           router,
+		ReadTimeout:       getTimeoutFromEnv("SERVER_READ_TIMEOUT_SECONDS", 0),
+		ReadHeaderTimeout: getTimeoutFromEnv("SERVER_READ_HEADER_TIMEOUT_SECONDS", 0),
+		WriteTimeout:      getTimeoutFromEnv("SERVER_WRITE_TIMEOUT_SECONDS", 0),
+		IdleTimeout:       getTimeoutFromEnv("SERVER_IDLE_TIMEOUT_SECONDS", 0),
+	}
+
 	log.Infoln("Server started on interface", listenInterface)
-	if err := router.Run(listenInterface); err != nil {
+	log.Debugf("HTTP server timeouts: read=%s read-header=%s write=%s idle=%s",
+		srv.ReadTimeout, srv.ReadHeaderTimeout, srv.WriteTimeout, srv.IdleTimeout)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Failed to run server: %v", err)
 	}
 }
@@ -984,6 +1003,7 @@ func createLLM() (llms.Model, error) {
 		opts := []ollama.Option{
 			ollama.WithModel(llmModel),
 			ollama.WithServerURL(host),
+			ollama.WithHTTPClient(createCustomHTTPClient()),
 		}
 		if ctxLenStr := os.Getenv("OLLAMA_CONTEXT_LENGTH"); ctxLenStr != "" {
 			if parsed, err := strconv.Atoi(ctxLenStr); err == nil && parsed > 0 {
@@ -1092,6 +1112,7 @@ func createVisionLLM() (llms.Model, error) {
 		opts := []ollama.Option{
 			ollama.WithModel(visionLlmModel),
 			ollama.WithServerURL(host),
+			ollama.WithHTTPClient(createCustomHTTPClient()),
 		}
 		if ctxLenStr := os.Getenv("OLLAMA_CONTEXT_LENGTH"); ctxLenStr != "" {
 			if parsed, err := strconv.Atoi(ctxLenStr); err == nil && parsed > 0 {
@@ -1145,11 +1166,34 @@ func createCustomHTTPClient() *http.Client {
 		},
 	}
 
-	// Create custom client with the transport
-	httpClient := http.DefaultClient
-	httpClient.Transport = customTransport
+	// Create a dedicated client with the transport. We intentionally do NOT
+	// reuse http.DefaultClient here so we don't mutate the global client shared
+	// by the rest of the process.
+	httpClient := &http.Client{
+		Transport: customTransport,
+		// Overall request timeout for outbound LLM calls. Defaults to 0
+		// (no timeout) so long-running local models (e.g. Ollama) are not
+		// cut off; configurable via LLM_HTTP_TIMEOUT_SECONDS.
+		Timeout: getTimeoutFromEnv("LLM_HTTP_TIMEOUT_SECONDS", 0),
+	}
 
 	return httpClient
+}
+
+// getTimeoutFromEnv reads a timeout in seconds from the given environment
+// variable. A value of 0 (the typical default) means "no timeout". Invalid or
+// negative values fall back to the provided default and are logged.
+func getTimeoutFromEnv(envVar string, defaultSeconds int) time.Duration {
+	raw := os.Getenv(envVar)
+	if raw == "" {
+		return time.Duration(defaultSeconds) * time.Second
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 0 {
+		log.Warnf("Invalid %s value %q, falling back to %d seconds", envVar, raw, defaultSeconds)
+		return time.Duration(defaultSeconds) * time.Second
+	}
+	return time.Duration(parsed) * time.Second
 }
 
 // headerTransport is a custom http.RoundTripper that adds custom headers to requests
